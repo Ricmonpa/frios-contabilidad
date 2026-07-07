@@ -1,0 +1,19 @@
+# Secretos — NUNCA subir claves de API
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Herramientas locales
+.claude/
+
+# Documentos internos de trabajo (no son parte de la app)
+*.docx
+*.xlsb
+
+# Sistema
+.DS_Store
+Thumbs.db
