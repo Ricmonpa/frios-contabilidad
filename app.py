@@ -8,6 +8,7 @@ y generación del Anexo 11 - IVA Acreditable (DIOT).
 Ejecutar con:  streamlit run app.py
 """
 
+import os
 import time
 import base64
 import random
@@ -369,11 +370,20 @@ def ejecutar_conciliacion(df_sat: pd.DataFrame, df_sap: pd.DataFrame) -> dict:
 # Si existe GEMINI_API_KEY en st.secrets, usa la API de Gemini con el
 # contexto de la conciliación; si algo falla, cae a las reglas.
 # ---------------------------------------------------------------------------
-def _gemini_api_key() -> str:
+def _secreto(nombre: str, default: str = "") -> str:
+    """Lee un secreto de st.secrets (Streamlit Cloud / local) o de variables
+    de entorno (Railway, Render, etc.)."""
     try:
-        return st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:  # sin archivo secrets.toml en local
-        return ""
+        valor = st.secrets.get(nombre, "")
+        if valor:
+            return valor
+    except Exception:  # sin archivo secrets.toml
+        pass
+    return os.environ.get(nombre, default)
+
+
+def _gemini_api_key() -> str:
+    return _secreto("GEMINI_API_KEY")
 
 
 def _contexto_conciliacion() -> str:
@@ -405,10 +415,7 @@ def responder_con_gemini(pregunta: str) -> str | None:
     try:
         from google import genai
 
-        try:
-            modelo = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
-        except Exception:
-            modelo = "gemini-2.5-flash"
+        modelo = _secreto("GEMINI_MODEL", "gemini-2.5-flash")
         client = genai.Client(api_key=api_key)
         prompt = (
             "Eres el Agente Contable de Frios, un asistente de N3Labs que ayuda al "
