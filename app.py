@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-N3Labs | Agente Contable Frios - Conciliador Mágico
+N3Labs | Agente Contable Frios - Conciliador Automático
 ====================================================
 Demo de conciliación automática SAT (Dsoft) vs SAP Business One
 y generación del Anexo 11 - IVA Acreditable (DIOT).
@@ -85,11 +85,10 @@ st.markdown(
         border-radius: 12px; padding: 14px 16px; text-align: center;
         margin-top: 6px;
     }}
-    .n3-block img {{ height: 46px; margin-bottom: 4px; }}
+    .n3-block img {{ height: 52px; margin-top: 8px; }}
     .n3-block .n3-caption {{
-        color: #EAD9F2; font-size: 0.78rem; letter-spacing: 0.3px; margin: 0;
+        color: #EAD9F2; font-size: 0.82rem; letter-spacing: 0.3px; margin: 0;
     }}
-    .n3-block .n3-name {{ color: #FFFFFF; font-weight: 700; font-size: 0.95rem; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -564,7 +563,7 @@ with st.sidebar:
             f'<img src="{LOGO_FRIOS}" alt="Frios" style="height:46px;border-radius:8px;">',
             unsafe_allow_html=True,
         )
-    st.markdown("**Agente Contable — Fase 2**")
+    st.markdown("**Agente Contable**")
     st.caption(f"Cliente: **Frios** · Periodo: **Mayo 2025** · {datetime.now():%d/%m/%Y}")
     st.divider()
     st.markdown(
@@ -577,9 +576,9 @@ with st.sidebar:
     st.divider()
     _n3_img = f'<img src="{LOGO_N3}" alt="N3Labs">' if LOGO_N3 else ""
     st.markdown(
-        f'<div class="n3-block">{_n3_img}'
-        f'<p class="n3-caption">Desarrollado por</p>'
-        f'<p class="n3-name">N3Labs</p></div>',
+        f'<div class="n3-block">'
+        f'<p class="n3-caption">Hecho por</p>'
+        f'{_n3_img}</div>',
         unsafe_allow_html=True,
     )
     st.caption("© 2025 N3Labs · Demo confidencial")
@@ -590,7 +589,7 @@ with st.sidebar:
 _logo_img = f'<img src="{LOGO_FRIOS}" alt="Frios">' if LOGO_FRIOS else ""
 st.markdown(
     f'<div class="brand-header">{_logo_img}'
-    f'<p class="main-title">Agente Contable - Conciliador Mágico ✨</p></div>',
+    f'<p class="main-title">Agente Contable - Conciliador Automático ✨</p></div>',
     unsafe_allow_html=True,
 )
 st.markdown('<p class="subtitle">Conciliación automática SAT (Dsoft) vs SAP Business One · Anexo 11 - IVA Acreditable (DIOT)</p>', unsafe_allow_html=True)
@@ -755,7 +754,7 @@ with tab2:
 # TAB 3 — CHAT CONTABLE (AGENTE FASE 2)
 # ===========================================================================
 with tab3:
-    st.subheader("💬 Chat Contable — Agente IA (Fase 2)")
+    st.subheader("💬 Chat Contable — Agente IA")
     st.caption(
         "Pregunta en lenguaje natural sobre la conciliación: facturas faltantes, "
         "diferencias de montos, IVA acreditable o el Anexo 11."
