@@ -213,41 +213,60 @@ def normalizar_sat(df: pd.DataFrame) -> pd.DataFrame:
     return df[orden].reset_index(drop=True)
 
 
-def leer_archivo_subido(archivo) -> pd.DataFrame:
-    """Lee CSV / XLSX / XLSB. Si es el Anexo 11 real (.xlsb), busca la hoja de
-    CFDIs recibidos de Dsoft y detecta la fila de encabezados automáticamente."""
+def leer_archivo_subido(archivo):
+    """Lee CSV / XLSX / XLSB. Devuelve (df_normalizado, hoja_cruda, complementos).
+
+    Si es el Anexo 11 real (.xlsb), busca la hoja con más facturas (la
+    "1.3 Pagos con UUID"), conserva sus columnas originales (cuenta bancaria,
+    pólizas, folios) y además lee la hoja de complementos de pago (1.4)."""
     nombre = archivo.name.lower()
     if nombre.endswith(".csv"):
-        return normalizar_sat(pd.read_csv(archivo))
+        return normalizar_sat(pd.read_csv(archivo)), None, None
 
     engine = "pyxlsb" if nombre.endswith(".xlsb") else None
     xls = pd.ExcelFile(archivo, engine=engine)
 
-    # Revisa todas las hojas con columna UUID y usa la que tenga más facturas
-    # (en el Anexo 11 real, "1.3 Pagos con UUID" trae el detalle completo).
-    mejor, max_filas = None, 0
-    for hoja in xls.sheet_names:
+    def _fila_encabezado(hoja, texto):
         try:
             crudo = xls.parse(hoja, header=None, nrows=15)
         except Exception:
-            continue
-        fila_hdr = None
+            return None
         for i in range(len(crudo)):
-            if any(str(v).strip().upper() == "UUID" for v in crudo.iloc[i].tolist()):
-                fila_hdr = i
-                break
+            if any(str(v).strip().upper() == texto for v in crudo.iloc[i].tolist()):
+                return i
+        return None
+
+    # Hoja principal: la que tenga más filas con UUID válido
+    mejor, mejor_crudo, max_filas = None, None, 0
+    for hoja in xls.sheet_names:
+        fila_hdr = _fila_encabezado(hoja, "UUID")
         if fila_hdr is None:
             continue
         try:
-            datos = normalizar_sat(xls.parse(hoja, header=fila_hdr))
+            crudo = xls.parse(hoja, header=fila_hdr)
+            datos = normalizar_sat(crudo)
         except Exception:
             continue
         if len(datos) > max_filas:
-            mejor, max_filas = datos, len(datos)
+            mejor, mejor_crudo, max_filas = datos, crudo, len(datos)
 
     if mejor is None:
         raise ValueError("Ninguna hoja del archivo contiene una columna UUID.")
-    return mejor
+
+    # Hoja de complementos de pago (1.4): se identifica por la columna UUIDRel
+    complementos = None
+    for hoja in xls.sheet_names:
+        if "complemento" not in hoja.lower():
+            continue
+        fila_hdr = _fila_encabezado(hoja, "UUIDREL")
+        if fila_hdr is not None:
+            try:
+                complementos = xls.parse(hoja, header=fila_hdr)
+            except Exception:
+                complementos = None
+        break
+
+    return mejor, mejor_crudo, complementos
 
 
 def generar_mock_sap(df_sat: pd.DataFrame) -> pd.DataFrame:
@@ -296,9 +315,240 @@ def generar_mock_sap(df_sat: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# PAPEL DE TRABAJO — ANEXO 11 (formato Frios, hoja "IVA")
+# Réplica de la estructura real: 1.1 estados de cuenta · 1.2 CFDI · 1.3 SAP ·
+# 1.4 complementos de pago, con cruce y diferencia por factura.
+# ---------------------------------------------------------------------------
+COLS_PAPEL_BANCO = ["BANCO", "# MOVIMIENTO", "REF", "CONCEPTO", "REFERENCIA AMPLIADA",
+                    "IMPORTE", "FECHA PAGO BANCO", "CRUCE"]
+COLS_PAPEL_CFDI = ["RFC", "NOMBRE", "UUID FOLIO FISCAL", "REGIMEN FISCAL",
+                   "FECHA COMPROBANTE", "CONCEPTO DEL BIEN O SERVICIO",
+                   "BASE 16%", "BASE 8%", "BASE 0%", "BASE EXENTA", "IVA", "IEPS",
+                   "RET IVA", "RET ISR", "TOTAL CFDI", "MONEDA",
+                   "FORMA DE PAGO", "METODO PAGO"]
+COLS_PAPEL_SAP = ["NÚMERO DE PROVEEDOR", "FOLIO EXTERNO", "NÚMERO DE PAGO SISTEMA",
+                  "FECHA DE PAGO SISTEMA", "TOTAL PAGO", "TIPO",
+                  "NÚMERO PÓLIZA SISTEMA", "FECHA PÓLIZA", "CUENTA CONTABLE",
+                  "NOMBRE CUENTA", "DIF", "COMENTARIOS"]
+COLS_PAPEL_CP = ["COMPLEMENTO DE PAGO (UUID)", "MONTO DEL PAGO", "FECHA COMPLEMENTO",
+                 "BASE 16% (CP)", "IVA (CP)", "TOTAL (CP)"]
+COLS_PAPEL = COLS_PAPEL_BANCO + COLS_PAPEL_CFDI + COLS_PAPEL_SAP + COLS_PAPEL_CP
+COLS_PAPEL_DINERO = ["IMPORTE", "BASE 16%", "BASE 8%", "BASE 0%", "BASE EXENTA",
+                     "IVA", "IEPS", "RET IVA", "RET ISR", "TOTAL CFDI", "TOTAL PAGO",
+                     "DIF", "MONTO DEL PAGO", "BASE 16% (CP)", "IVA (CP)", "TOTAL (CP)"]
+
+
+def construir_papel_trabajo(merge: pd.DataFrame, crudo: pd.DataFrame | None,
+                            complementos: pd.DataFrame | None) -> pd.DataFrame:
+    """Arma el papel de trabajo del Anexo 11 fila por fila.
+
+    Con archivo real usa las columnas originales de la hoja 1.3 (cuenta,
+    pólizas, folios) y los complementos reales de la 1.4; en modo demo
+    sintetiza esos datos de forma verosímil."""
+    rng = random.Random(7)
+    bancos = ["Bancomer", "Banorte", "Santander"]
+
+    # Índices por UUID para cruzar contra las hojas reales
+    idx_crudo, cols_crudo = None, {}
+    if crudo is not None and "UUID" in [str(c).strip().upper() for c in crudo.columns]:
+        cols_crudo = {str(c).strip().upper(): c for c in crudo.columns}
+        idx_crudo = crudo.copy()
+        idx_crudo["__uuid"] = idx_crudo[cols_crudo["UUID"]].astype(str).str.strip().str.upper()
+        idx_crudo = idx_crudo.drop_duplicates("__uuid").set_index("__uuid")
+
+    idx_cp, cols_cp = None, {}
+    if complementos is not None:
+        cols_cp = {str(c).strip().upper(): c for c in complementos.columns}
+        if "UUIDREL" in cols_cp:
+            idx_cp = complementos.copy()
+            idx_cp["__uuid"] = idx_cp[cols_cp["UUIDREL"]].astype(str).str.strip().str.upper()
+            idx_cp = idx_cp.drop_duplicates("__uuid").set_index("__uuid")
+
+    def _crudo_val(uuid, *nombres):
+        if idx_crudo is None or uuid not in idx_crudo.index:
+            return None
+        for n in nombres:
+            col = cols_crudo.get(n.upper())
+            if col is not None:
+                v = idx_crudo.at[uuid, col]
+                if pd.notna(v) and str(v).strip() != "":
+                    return v
+        return None
+
+    def _num(v):
+        v = pd.to_numeric(v, errors="coerce") if v is not None else None
+        return round(float(v), 2) if v is not None and pd.notna(v) else None
+
+    filas = []
+    solo_sat = merge[merge["_merge"] != "right_only"].reset_index(drop=True)
+    for i, f in solo_sat.iterrows():
+        uuid = str(f["UUID"]).strip().upper()
+        falta_en_sap = f["_merge"] == "left_only"
+        con_diferencia = f["Estatus Conciliación"] == "⚠️ Diferencia de monto"
+        es_ppd = "PPD" in str(f["Método Pago"]).upper() or "PARCIALIDADES" in str(f["Método Pago"]).upper()
+
+        banco = str(_crudo_val(uuid, "NOMBRE CUENTA") or rng.choice(bancos))
+        fecha_pago = _crudo_val(uuid, "FECHA") or f["Fecha Emisión"]
+        total_pago = _num(_crudo_val(uuid, "TOTAL PAGO")) or f["Total"]
+        folio_ext = _crudo_val(uuid, "FOLIOEXTERNO") or f"{f['Serie']}{f['Folio']}"
+
+        fila = {
+            # ---- 1.1 Estados de cuenta ----
+            "BANCO": banco,
+            "# MOVIMIENTO": str(rng.randint(200000, 990000)) if crudo is None else "",
+            "REF": str(rng.randint(100000, 999999)) if crudo is None else "",
+            "CONCEPTO": str(f["Proveedor"])[:28],
+            "REFERENCIA AMPLIADA": f"PAGO FACTURA {folio_ext}",
+            "IMPORTE": -round(float(total_pago), 2) if not falta_en_sap else None,
+            "FECHA PAGO BANCO": str(fecha_pago)[:10] if not falta_en_sap else "",
+            "CRUCE": f"{banco[:3].upper()}{i + 1}" if not falta_en_sap else "",
+            # ---- 1.2 CFDI recibidos (SAT / Dsoft) ----
+            "RFC": f["RFC Emisor"],
+            "NOMBRE": f["Proveedor"],
+            "UUID FOLIO FISCAL": f["UUID"],
+            "REGIMEN FISCAL": str(_crudo_val(uuid, "REGIMEN") or "601"),
+            "FECHA COMPROBANTE": str(f["Fecha Emisión"])[:10],
+            "CONCEPTO DEL BIEN O SERVICIO": f"BIENES Y SERVICIOS {str(f['Proveedor'])[:20]}",
+            "BASE 16%": f["Base IVA 16%"],
+            "BASE 8%": 0.0, "BASE 0%": 0.0, "BASE EXENTA": 0.0,
+            "IVA": f["IVA"], "IEPS": 0.0,
+            "RET IVA": _num(_crudo_val(uuid, "RETENCION")) or 0.0,
+            "RET ISR": 0.0,
+            "TOTAL CFDI": f["Total"],
+            "MONEDA": str(f["Moneda"]).replace("$", "MXN") or "MXN",
+            "FORMA DE PAGO": "Transferencia electrónica",
+            "METODO PAGO": "PPD" if es_ppd else "PUE",
+        }
+
+        # ---- 1.3 SAP Business One ----
+        if falta_en_sap:
+            fila.update({c: (None if c in ("TOTAL PAGO", "DIF") else "") for c in COLS_PAPEL_SAP})
+            fila["COMENTARIOS"] = "NO REGISTRADA EN SAP — registrar antes del cierre"
+        else:
+            dif = round(float(f["Dif. IVA"]), 2) if pd.notna(f["Dif. IVA"]) else 0.0
+            fila.update({
+                "NÚMERO DE PROVEEDOR": str(_crudo_val(uuid, "CLIENTE") or f"P{rng.randint(10, 999):04d}"),
+                "FOLIO EXTERNO": str(folio_ext),
+                "NÚMERO DE PAGO SISTEMA": str(_crudo_val(uuid, "PAGO") or rng.randint(48000, 48999)),
+                "FECHA DE PAGO SISTEMA": str(fecha_pago)[:10],
+                "TOTAL PAGO": round(float(total_pago), 2),
+                "TIPO": str(_crudo_val(uuid, "TIPO") or "FACTURA"),
+                "NÚMERO PÓLIZA SISTEMA": str(_crudo_val(uuid, "ASIENTO TT")
+                                             or f.get("DocEntry") or rng.randint(2400000, 2499999)),
+                "FECHA PÓLIZA": str(_crudo_val(uuid, "FECHA TT") or fecha_pago)[:10],
+                "CUENTA CONTABLE": str(_crudo_val(uuid, "CUENTA") or "11102002"),
+                "NOMBRE CUENTA": banco,
+                "DIF": dif,
+                "COMENTARIOS": ("Corregir captura de IVA en SAP" if con_diferencia else "OK"),
+            })
+
+        # ---- 1.4 Complemento de pago (solo facturas PPD) ----
+        cp_uuid, cp_monto, cp_fecha, cp_base, cp_iva, cp_total = "", None, "", None, None, None
+        if es_ppd and not falta_en_sap:
+            if idx_cp is not None:
+                if uuid in idx_cp.index:
+                    g = idx_cp.loc[uuid]
+                    col = lambda n: cols_cp.get(n.upper())
+                    cp_uuid = str(g[col("UUID")]) if col("UUID") else ""
+                    cp_monto = _num(g[col("MONTO")]) if col("MONTO") else None
+                    cp_fecha = str(g[col("FECHA")])[:10] if col("FECHA") else ""
+                    cp_base = _num(g[col("BASE IVA 16% TRASLADO")]) if col("BASE IVA 16% TRASLADO") else None
+                    cp_iva = _num(g[col("IVA 16% TRASLADO")]) if col("IVA 16% TRASLADO") else None
+                    cp_total = _num(g[col("IMPPAGADO")]) if col("IMPPAGADO") else cp_monto
+            else:  # modo demo: sintetizar el complemento
+                cp_uuid = _uuid_falso(rng)
+                cp_monto = cp_total = round(float(total_pago), 2)
+                cp_fecha = str(fecha_pago)[:10]
+                cp_base = f["Base IVA 16%"]
+                cp_iva = f["IVA"]
+        fila.update({
+            "COMPLEMENTO DE PAGO (UUID)": cp_uuid,
+            "MONTO DEL PAGO": cp_monto,
+            "FECHA COMPLEMENTO": cp_fecha,
+            "BASE 16% (CP)": cp_base,
+            "IVA (CP)": cp_iva,
+            "TOTAL (CP)": cp_total,
+        })
+        filas.append(fila)
+
+    return pd.DataFrame(filas, columns=COLS_PAPEL)
+
+
+def exportar_excel_papel(resultado: dict) -> bytes:
+    """Genera el Excel del papel de trabajo con el layout del Anexo 11 real:
+    títulos, bloques 1.1–1.4, encabezados y fila de TOTALES (DIOT)."""
+    import io
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    papel = resultado["papel"]
+    morado = "5D1F77"
+    lila = "EADAF2"
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        papel.to_excel(w, sheet_name="IVA (Papel de Trabajo)", startrow=4, index=False)
+        ws = w.sheets["IVA (Papel de Trabajo)"]
+
+        ws["A1"] = "FRIOS"
+        ws["A1"].font = Font(bold=True, size=14, color=morado)
+        ws["A2"] = "Papel de Trabajo — Anexo 11 · IVA Acreditable (DIOT)"
+        ws["A2"].font = Font(bold=True, size=11)
+        ws["A3"] = "Generado automáticamente por el Agente Contable · N3Labs"
+        ws["A3"].font = Font(italic=True, size=9, color="777777")
+
+        # Fila de bloques (1.1 – 1.4) con celdas combinadas
+        bloques = [
+            ("1.1  ESTADOS DE CUENTA", len(COLS_PAPEL_BANCO)),
+            ("1.2  CFDI RECIBIDOS (SAT / DSOFT)", len(COLS_PAPEL_CFDI)),
+            ("1.3  SAP BUSINESS ONE", len(COLS_PAPEL_SAP)),
+            ("1.4  COMPLEMENTOS DE PAGO", len(COLS_PAPEL_CP)),
+        ]
+        col = 1
+        for titulo, ancho in bloques:
+            c = ws.cell(row=4, column=col, value=titulo)
+            c.font = Font(bold=True, color="FFFFFF", size=10)
+            c.fill = PatternFill("solid", fgColor=morado)
+            c.alignment = Alignment(horizontal="center")
+            ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col + ancho - 1)
+            col += ancho
+
+        # Encabezados
+        for j in range(1, len(COLS_PAPEL) + 1):
+            c = ws.cell(row=5, column=j)
+            c.font = Font(bold=True, size=9, color=morado)
+            c.fill = PatternFill("solid", fgColor=lila)
+
+        # Fila TOTALES (como el renglón "ACREDITAMIENTO DIOT" del papel real)
+        fila_tot = 5 + len(papel) + 1
+        ws.cell(row=fila_tot, column=1, value="TOTALES — ACREDITAMIENTO DIOT").font = Font(bold=True, color=morado)
+        for nombre in ["BASE 16%", "IVA", "RET IVA", "RET ISR", "TOTAL CFDI", "TOTAL PAGO"]:
+            j = papel.columns.get_loc(nombre) + 1
+            total = pd.to_numeric(papel[nombre], errors="coerce").sum()
+            c = ws.cell(row=fila_tot, column=j, value=round(float(total), 2))
+            c.font = Font(bold=True, color=morado)
+            c.fill = PatternFill("solid", fgColor=lila)
+            c.number_format = "#,##0.00"
+
+        for j, nombre in enumerate(COLS_PAPEL, start=1):
+            letra = ws.cell(row=5, column=j).column_letter
+            ws.column_dimensions[letra].width = 34 if "UUID" in nombre else 15
+            if nombre in COLS_PAPEL_DINERO:
+                for r in range(6, 6 + len(papel)):
+                    ws.cell(row=r, column=j).number_format = "#,##0.00"
+
+        # Hojas complementarias
+        cols_disc = ["Estatus Conciliación", "UUID", "Proveedor", "RFC Emisor",
+                     "IVA", "IVA SAP", "Dif. IVA", "Total", "Total SAP"]
+        resultado["discrepancias"][cols_disc].to_excel(w, sheet_name="Discrepancias", index=False)
+        resultado["anexo11"].to_excel(w, sheet_name="DIOT (Anexo 11)", index=False)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # LÓGICA DE CONCILIACIÓN
 # ---------------------------------------------------------------------------
-def ejecutar_conciliacion(df_sat: pd.DataFrame, df_sap: pd.DataFrame) -> dict:
+def ejecutar_conciliacion(df_sat: pd.DataFrame, df_sap: pd.DataFrame,
+                          crudo: pd.DataFrame | None = None,
+                          complementos: pd.DataFrame | None = None) -> dict:
     """Cruza SAT vs SAP por UUID y clasifica cada factura."""
     sap = df_sap[["UUID", "DocEntry", "Subtotal", "IVA", "Total Factura"]].rename(
         columns={"Subtotal": "Base SAP", "IVA": "IVA SAP", "Total Factura": "Total SAP"}
@@ -355,6 +605,7 @@ def ejecutar_conciliacion(df_sat: pd.DataFrame, df_sap: pd.DataFrame) -> dict:
         "conciliadas": conciliadas,
         "discrepancias": discrepancias,
         "anexo11": anexo,
+        "papel": construir_papel_trabajo(m, crudo, complementos),
         "n_conciliadas": len(conciliadas),
         "n_faltantes": int((m["Estatus Conciliación"] == "❌ Falta en SAP").sum()),
         "n_diferencias": int((m["Estatus Conciliación"] == "⚠️ Diferencia de monto").sum()),
@@ -498,6 +749,22 @@ def responder_con_reglas(pregunta: str) -> str:
             f"**\\${r['iva_acreditable'] + r['iva_en_riesgo']:,.2f}**."
         )
 
+    # --- Papel de trabajo ---
+    if any(k in q for k in ["papel", "columnas", "banco", "complemento", "devoluci"]):
+        papel = r.get("papel")
+        n_cp = int((papel["COMPLEMENTO DE PAGO (UUID)"].astype(str).str.len() > 10).sum()) if papel is not None else 0
+        return (
+            "El **Papel de Trabajo del Anexo 11** ya está generado en la pestaña 2, "
+            "con la estructura completa del formato de Frios:\n\n"
+            "- **1.1 Estados de cuenta** (banco, movimiento, importe, cruce)\n"
+            "- **1.2 CFDI recibidos** (UUID, bases por tasa, IVA, retenciones)\n"
+            "- **1.3 SAP Business One** (pago, póliza, cuenta contable, DIF)\n"
+            "- **1.4 Complementos de pago** (UUID del CP, monto, base e IVA)\n\n"
+            f"Incluye {len(papel) if papel is not None else 0} facturas y {n_cp} complementos de pago vinculados. "
+            "Puedes descargarlo en **Excel** con la fila de TOTALES (acreditamiento DIOT), "
+            "listo para la relación de comprobación de devoluciones de IVA. 📄"
+        )
+
     # --- Anexo 11 / DIOT ---
     if any(k in q for k in ["anexo", "diot", "reporte", "declaración", "declaracion"]):
         top = r["anexo11"].head(3)
@@ -541,6 +808,10 @@ if "df_sat" not in st.session_state:
     st.session_state.origen_sat = "Datos de demostración (formato Dsoft/SAT)"
 if "df_sap" not in st.session_state:
     st.session_state.df_sap = None
+if "crudo_sat" not in st.session_state:
+    st.session_state.crudo_sat = None
+if "cp_sat" not in st.session_state:
+    st.session_state.cp_sat = None
 if "resultado" not in st.session_state:
     st.session_state.resultado = None
 if "chat" not in st.session_state:
@@ -615,7 +886,10 @@ with tab1:
         )
         if archivo is not None:
             try:
-                st.session_state.df_sat = leer_archivo_subido(archivo)
+                df_leido, crudo_leido, cp_leido = leer_archivo_subido(archivo)
+                st.session_state.df_sat = df_leido
+                st.session_state.crudo_sat = crudo_leido
+                st.session_state.cp_sat = cp_leido
                 st.session_state.origen_sat = f"Archivo cargado: {archivo.name}"
                 st.session_state.df_sap = None
                 st.session_state.resultado = None
@@ -679,7 +953,8 @@ with tab2:
             with st.spinner("El agente está cruzando UUIDs, validando montos e identificando discrepancias..."):
                 time.sleep(2.0)
                 st.session_state.resultado = ejecutar_conciliacion(
-                    st.session_state.df_sat, st.session_state.df_sap
+                    st.session_state.df_sat, st.session_state.df_sap,
+                    st.session_state.crudo_sat, st.session_state.cp_sat,
                 )
             st.toast("Conciliación completada", icon="🎉")
 
@@ -748,6 +1023,31 @@ with tab2:
             data=csv,
             file_name="Anexo11_IVA_Acreditable_DIOT.csv",
             mime="text/csv",
+        )
+
+        st.divider()
+        st.markdown("### 📄 Papel de Trabajo — Anexo 11 (formato Frios)")
+        st.caption(
+            "Estructura del papel de trabajo real, factura por factura: "
+            "**1.1 estados de cuenta · 1.2 CFDI recibidos · 1.3 SAP Business One · "
+            "1.4 complementos de pago**, con cruce y diferencia. Es la base de la DIOT "
+            "y de la relación de comprobación para devoluciones de IVA."
+        )
+        st.dataframe(
+            r["papel"],
+            width="stretch",
+            height=420,
+            column_config={
+                c: st.column_config.NumberColumn(format="$%.2f")
+                for c in COLS_PAPEL_DINERO
+            },
+        )
+        st.download_button(
+            "⬇️ Descargar Papel de Trabajo completo (Excel)",
+            data=exportar_excel_papel(r),
+            file_name="Anexo11_Papel_de_Trabajo_IVA_Acreditable.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
         )
 
 # ===========================================================================
