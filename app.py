@@ -544,6 +544,104 @@ def exportar_excel_papel(resultado: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# MÓDULO 2 (VISTA PREVIA) — CONCILIACIÓN BANCARIA DE EGRESOS
+# Simula la ingesta del estado de cuenta (formato hoja "1.1 BBVA" del papel
+# real) y el cruce automático banco ↔ SAP ↔ CFDI con CRUZE y DIF.
+# ---------------------------------------------------------------------------
+def generar_estado_cuenta_mock(papel: pd.DataFrame) -> pd.DataFrame:
+    """Estado de cuenta simulado a partir de los pagos del papel de trabajo,
+    con discrepancias intencionales: comisiones sin CFDI y un pago de SAP
+    que no aparece en el banco."""
+    rng = random.Random(11)
+    pagados = papel[papel["IMPORTE"].notna()].reset_index(drop=True)
+
+    filas = []
+    for i, f in pagados.iterrows():
+        filas.append({
+            "Banco": f["BANCO"],
+            "No. Movimiento": str(f["# MOVIMIENTO"]) or str(rng.randint(200000, 990000)),
+            "Fecha Operación": f["FECHA PAGO BANCO"],
+            "Concepto": f["CONCEPTO"],
+            "Referencia Ampliada": f["REFERENCIA AMPLIADA"],
+            "Cargo": f["IMPORTE"],
+            "UUID": f["UUID FOLIO FISCAL"],
+        })
+
+    # Un pago registrado en SAP que NO aparece en el banco
+    if len(filas) > 4:
+        filas.pop(rng.randrange(len(filas)))
+
+    # Comisiones bancarias sin factura (cargos sin CFDI)
+    for concepto, monto in [("COMISION MEMBRESIA", -348.00),
+                            ("COMISION TRANSFERENCIA SPEI", -87.00),
+                            ("IVA COMISIONES", -69.60)]:
+        filas.append({
+            "Banco": rng.choice(["Bancomer", "Banorte"]),
+            "No. Movimiento": str(rng.randint(200000, 990000)),
+            "Fecha Operación": "2025-05-30",
+            "Concepto": concepto,
+            "Referencia Ampliada": concepto,
+            "Cargo": monto,
+            "UUID": "",
+        })
+    return pd.DataFrame(filas)
+
+
+def cruzar_banco(estado: pd.DataFrame, papel: pd.DataFrame) -> dict:
+    """Cruce automático banco ↔ SAP ↔ CFDI (la columna CRUZE/DIF del papel
+    real, que hoy se hace a mano)."""
+    pagados = papel[papel["IMPORTE"].notna()].set_index("UUID FOLIO FISCAL")
+    uuids_banco = set(estado["UUID"][estado["UUID"].astype(str).str.len() > 10])
+
+    filas = []
+    for _, mov in estado.iterrows():
+        uuid = str(mov["UUID"])
+        if len(uuid) > 10 and uuid in pagados.index:
+            p = pagados.loc[uuid]
+            dif = round(abs(float(mov["Cargo"])) - float(p["TOTAL PAGO"]), 2)
+            filas.append({
+                "Banco": mov["Banco"], "Fecha": mov["Fecha Operación"],
+                "Concepto": mov["Concepto"], "Cargo": mov["Cargo"],
+                "# Pago SAP": p["NÚMERO DE PAGO SISTEMA"],
+                "Póliza": p["NÚMERO PÓLIZA SISTEMA"],
+                "Proveedor": p["NOMBRE"],
+                "CRUZE": abs(mov["Cargo"]),
+                "DIF": dif,
+                "Estatus": "✅ Cruzado" if abs(dif) < 0.01 else "⚠️ Diferencia",
+            })
+        else:
+            filas.append({
+                "Banco": mov["Banco"], "Fecha": mov["Fecha Operación"],
+                "Concepto": mov["Concepto"], "Cargo": mov["Cargo"],
+                "# Pago SAP": "", "Póliza": "", "Proveedor": "",
+                "CRUZE": None, "DIF": None,
+                "Estatus": "❌ Cargo sin CFDI",
+            })
+
+    # Pagos de SAP que no aparecen en el banco
+    sin_banco = pagados[~pagados.index.isin(uuids_banco)].reset_index()
+    for _, p in sin_banco.iterrows():
+        filas.append({
+            "Banco": p["BANCO"], "Fecha": p["FECHA DE PAGO SISTEMA"],
+            "Concepto": p["CONCEPTO"], "Cargo": None,
+            "# Pago SAP": p["NÚMERO DE PAGO SISTEMA"],
+            "Póliza": p["NÚMERO PÓLIZA SISTEMA"],
+            "Proveedor": p["NOMBRE"],
+            "CRUZE": None, "DIF": None,
+            "Estatus": "🔎 Pago SAP sin reflejo en banco",
+        })
+
+    tabla = pd.DataFrame(filas)
+    return {
+        "tabla": tabla,
+        "n_cruzados": int((tabla["Estatus"] == "✅ Cruzado").sum()),
+        "n_sin_cfdi": int((tabla["Estatus"] == "❌ Cargo sin CFDI").sum()),
+        "n_sin_banco": int((tabla["Estatus"] == "🔎 Pago SAP sin reflejo en banco").sum()),
+        "n_diferencias": int((tabla["Estatus"] == "⚠️ Diferencia").sum()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # LÓGICA DE CONCILIACIÓN
 # ---------------------------------------------------------------------------
 def ejecutar_conciliacion(df_sat: pd.DataFrame, df_sap: pd.DataFrame,
@@ -866,9 +964,13 @@ st.markdown(
 st.markdown('<p class="subtitle">Conciliación automática SAT (Dsoft) vs SAP Business One · Anexo 11 - IVA Acreditable (DIOT)</p>', unsafe_allow_html=True)
 st.divider()
 
-tab1, tab2, tab3 = st.tabs(
-    ["📥 1. Integración de Datos", "🤖 2. Conciliación Inteligente", "💬 3. Chat Contable (Agente)"]
-)
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📥 1. Integración de Datos",
+    "🤖 2. Conciliación Inteligente",
+    "💬 3. Chat Contable (Agente)",
+    "🏦 4. Conciliación Bancaria · Módulo 2",
+    "📈 5. Ingresos SAP↔Banca · Módulo 3",
+])
 
 # ===========================================================================
 # TAB 1 — INTEGRACIÓN DE DATOS
@@ -893,6 +995,7 @@ with tab1:
                 st.session_state.origen_sat = f"Archivo cargado: {archivo.name}"
                 st.session_state.df_sap = None
                 st.session_state.resultado = None
+                st.session_state.banco = None
                 st.success(f"✅ {len(st.session_state.df_sat)} CFDIs cargados desde **{archivo.name}**")
             except Exception as e:
                 st.error(f"No pude interpretar el archivo ({e}). Usando datos de demostración.")
@@ -956,6 +1059,7 @@ with tab2:
                     st.session_state.df_sat, st.session_state.df_sap,
                     st.session_state.crudo_sat, st.session_state.cp_sat,
                 )
+                st.session_state.banco = None
             st.toast("Conciliación completada", icon="🎉")
 
     r = st.session_state.resultado
@@ -1076,3 +1180,86 @@ with tab3:
                 respuesta = responder_agente(pregunta)
             st.markdown(respuesta)
         st.session_state.chat.append({"role": "assistant", "content": respuesta})
+
+# ===========================================================================
+# TAB 4 — CONCILIACIÓN BANCARIA (MÓDULO 2 · VISTA PREVIA)
+# ===========================================================================
+with tab4:
+    st.subheader("🏦 Conciliación Bancaria de Egresos")
+    st.markdown(
+        f'<span style="background:{FRIOS_PURPLE};color:white;padding:3px 12px;'
+        f'border-radius:12px;font-size:0.8rem;font-weight:700;">VISTA PREVIA · MÓDULO 2 DE LA RUTA INTEGRAL</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Ingesta de estados de cuenta multi-banco y cruce automático "
+        "**banco ↔ SAP ↔ CFDI** — las columnas CRUZE y DIF del papel de trabajo, "
+        "que hoy se llenan a mano, generadas por el agente."
+    )
+
+    if st.session_state.resultado is None:
+        st.warning("Primero ejecuta la conciliación SAT vs SAP en la pestaña **2. Conciliación Inteligente**.", icon="⚠️")
+    else:
+        if st.button("🏦 Cargar Estados de Cuenta y Cruzar (simulado)", type="primary", width="stretch"):
+            with st.spinner("Leyendo estados de cuenta... Cruzando movimientos contra SAP y CFDIs..."):
+                time.sleep(2.0)
+                estado = generar_estado_cuenta_mock(st.session_state.resultado["papel"])
+                st.session_state.banco = cruzar_banco(estado, st.session_state.resultado["papel"])
+            st.toast("Cruce bancario completado", icon="🏦")
+
+        b = st.session_state.get("banco")
+        if b is not None:
+            st.divider()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("✅ Movimientos Cruzados", b["n_cruzados"])
+            m2.metric("❌ Cargos sin CFDI", b["n_sin_cfdi"], delta="Comisiones / sin factura", delta_color="inverse")
+            m3.metric("🔎 Pagos SAP sin banco", b["n_sin_banco"], delta="Verificar en banco", delta_color="inverse")
+            m4.metric("⚠️ Diferencias", b["n_diferencias"])
+
+            st.divider()
+            st.markdown("### Cruce banco ↔ SAP ↔ CFDI")
+            st.dataframe(
+                b["tabla"],
+                width="stretch",
+                height=380,
+                column_config={
+                    "Cargo": st.column_config.NumberColumn(format="$%.2f"),
+                    "CRUZE": st.column_config.NumberColumn(format="$%.2f"),
+                    "DIF": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+            st.info(
+                "En el Módulo 2 completo, los estados de cuenta reales de cada banco "
+                "(Banorte, Bancomer, Santander…) se cargan automáticamente cada mes y el "
+                "cruce alimenta directo el bloque 1.1 del papel de trabajo.",
+                icon="🧩",
+            )
+
+# ===========================================================================
+# TAB 5 — INGRESOS SAP ↔ BANCA (MÓDULO 3 · RUTA)
+# ===========================================================================
+with tab5:
+    st.subheader("📈 Integración de Ingresos: SAP ↔ Banca")
+    st.markdown(
+        f'<span style="background:{FRIOS_PURPLE_LIGHT};color:white;padding:3px 12px;'
+        f'border-radius:12px;font-size:0.8rem;font-weight:700;">MÓDULO 3 · DISPONIBLE EN LA RUTA INTEGRAL</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+    st.markdown(
+        "El tercer módulo cierra el ciclo completo aplicando el **mismo motor de "
+        "conciliación** al lado de los ingresos:"
+    )
+    st.markdown(
+        "- 📄 Lectura de **CFDIs emitidos** y de los **cobros registrados en SAP** (cuentas por cobrar)\n"
+        "- 🏦 Cruce automático contra los **depósitos de los estados de cuenta**\n"
+        "- 🔎 Detección de **depósitos no identificados**, cobros sin depósito y diferencias\n"
+        "- 📋 **Papel de trabajo de ingresos**, equivalente al del Anexo 11, exportable a Excel\n"
+        "- 💬 Consultas en lenguaje natural: *\"¿qué depósitos no están facturados?\"*"
+    )
+    st.info(
+        "Este módulo se construye sobre la conexión a SAP y el motor de cruce de los "
+        "Módulos 1 y 2 — por eso en la ruta integral toma solo 5-6 semanas. "
+        "Para activarlo necesitamos los exports de CFDIs emitidos y cobros del periodo.",
+        icon="🗺️",
+    )
