@@ -9,6 +9,7 @@ Ejecutar con:  streamlit run app.py
 """
 
 import os
+import re
 import time
 import base64
 import random
@@ -544,89 +545,234 @@ def exportar_excel_papel(resultado: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# MÓDULO 2 (VISTA PREVIA) — CONCILIACIÓN BANCARIA DE EGRESOS
-# Simula la ingesta del estado de cuenta (formato hoja "1.1 BBVA" del papel
-# real) y el cruce automático banco ↔ SAP ↔ CFDI con CRUZE y DIF.
+# MÓDULO 2 — CONCILIACIÓN BANCARIA DE EGRESOS (motor real)
+# El banco no trae UUIDs: el cruce se hace agrupando facturas por PAGO
+# (un cargo bancario liquida N facturas) y cruzando cada cargo por
+# folio-en-referencia, o por importe + fecha, con tolerancias.
 # ---------------------------------------------------------------------------
+def agrupar_pagos_sap(papel: pd.DataFrame) -> pd.DataFrame:
+    """Agrupa el papel de trabajo por pago de SAP: un cargo bancario
+    corresponde a un pago, que puede liquidar varias facturas."""
+    pagados = papel[papel["TOTAL PAGO"].notna()].copy()
+    pagados["TOTAL PAGO"] = pd.to_numeric(pagados["TOTAL PAGO"], errors="coerce")
+    grupos = pagados.groupby("NÚMERO DE PAGO SISTEMA", as_index=False).agg(
+        **{
+            "FECHA PAGO": ("FECHA DE PAGO SISTEMA", "first"),
+            "TOTAL PAGO": ("TOTAL PAGO", "first"),
+            "BANCO": ("BANCO", "first"),
+            "PROVEEDORES": ("NOMBRE", lambda s: " / ".join(sorted(set(str(x)[:30] for x in s))[:3])),
+            "PÓLIZAS": ("NÚMERO PÓLIZA SISTEMA", lambda s: ", ".join(sorted(set(str(x) for x in s))[:3])),
+            "FOLIOS": ("FOLIO EXTERNO", lambda s: [str(x).strip().upper() for x in s if str(x).strip()]),
+            "N_FACTURAS": ("UUID FOLIO FISCAL", "count"),
+        }
+    )
+    return grupos
+
+
+def leer_estado_cuenta(archivo) -> pd.DataFrame:
+    """Lee un estado de cuenta bancario (CSV/XLSX/XLSB, formato tipo hoja
+    '1.1 BBVA'): detecta la hoja y la fila de encabezados por la columna
+    'Importe' y normaliza al esquema interno."""
+    nombre = archivo.name.lower()
+    if nombre.endswith(".csv"):
+        hojas = {"csv": pd.read_csv(archivo, header=None)}
+    else:
+        engine = "pyxlsb" if nombre.endswith(".xlsb") else None
+        xls = pd.ExcelFile(archivo, engine=engine)
+        hojas = {h: xls.parse(h, header=None) for h in xls.sheet_names}
+
+    mapa = {
+        "importe": "Cargo", "cargo": "Cargo", "monto": "Cargo",
+        "fecha operación": "Fecha", "fecha operacion": "Fecha", "fecha": "Fecha",
+        "concepto": "Concepto", "descripción": "Concepto", "descripcion": "Concepto",
+        "referencia ampliada": "Referencia Ampliada", "referencia": "Referencia",
+        "no. de movimiento": "No. Movimiento", "movimiento": "No. Movimiento",
+        "banco": "Banco",
+    }
+    mejor, max_filas = None, 0
+    for _, crudo in hojas.items():
+        fila_hdr = None
+        for i in range(min(12, len(crudo))):
+            celdas = [str(v).strip().lower() for v in crudo.iloc[i].tolist()]
+            if any(c in ("importe", "cargo") for c in celdas):
+                fila_hdr = i
+                break
+        if fila_hdr is None:
+            continue
+        df = crudo.iloc[fila_hdr + 1:].copy()
+        df.columns = [str(v).strip() for v in crudo.iloc[fila_hdr].tolist()]
+        renombres = {}
+        for col in df.columns:
+            clave = str(col).strip().lower()
+            if clave in mapa and mapa[clave] not in renombres.values():
+                renombres[col] = mapa[clave]
+        df = df.rename(columns=renombres)
+        if "Cargo" not in df.columns:
+            continue
+        df["Cargo"] = pd.to_numeric(df["Cargo"], errors="coerce")
+        df = df[df["Cargo"].notna()]
+        # Filtrar filas de totales/subtotales (sin fecha o etiquetadas TOTAL)
+        etiquetas = df.astype(str).apply(lambda s: s.str.upper().str.contains("TOTAL", na=False)).any(axis=1)
+        df = df[~etiquetas]
+        if "Fecha" in df.columns:
+            df = df[df["Fecha"].notna() & (df["Fecha"].astype(str).str.strip() != "")]
+        if len(df) > max_filas:
+            mejor, max_filas = df, len(df)
+
+    if mejor is None:
+        raise ValueError("No encontré una columna de Importe/Cargo en el archivo.")
+    for col in ["Fecha", "Concepto", "Referencia", "Referencia Ampliada", "No. Movimiento", "Banco"]:
+        if col not in mejor.columns:
+            mejor[col] = ""
+    # Fechas en serial de Excel → legibles
+    fechas = pd.to_numeric(mejor["Fecha"], errors="coerce")
+    seriales = fechas.between(35000, 60000)
+    if seriales.any():
+        mejor["Fecha"] = mejor["Fecha"].astype(str)
+        mejor.loc[seriales, "Fecha"] = pd.to_datetime(
+            fechas[seriales], unit="D", origin="1899-12-30").dt.strftime("%Y-%m-%d")
+    cols = ["Banco", "No. Movimiento", "Fecha", "Concepto", "Referencia",
+            "Referencia Ampliada", "Cargo"]
+    return mejor[cols].reset_index(drop=True)
+
+
 def generar_estado_cuenta_mock(papel: pd.DataFrame) -> pd.DataFrame:
-    """Estado de cuenta simulado a partir de los pagos del papel de trabajo,
-    con discrepancias intencionales: comisiones sin CFDI y un pago de SAP
-    que no aparece en el banco."""
+    """Estado de cuenta simulado a partir de los PAGOS de SAP (agrupados),
+    con discrepancias intencionales. No incluye UUIDs: el cruce lo hace el
+    motor real por referencia e importe."""
     rng = random.Random(11)
-    pagados = papel[papel["IMPORTE"].notna()].reset_index(drop=True)
+    pagos = agrupar_pagos_sap(papel)
 
     filas = []
-    for i, f in pagados.iterrows():
+    for _, p in pagos.iterrows():
+        folio = p["FOLIOS"][0] if p["FOLIOS"] else ""
         filas.append({
-            "Banco": f["BANCO"],
-            "No. Movimiento": str(f["# MOVIMIENTO"]) or str(rng.randint(200000, 990000)),
-            "Fecha Operación": f["FECHA PAGO BANCO"],
-            "Concepto": f["CONCEPTO"],
-            "Referencia Ampliada": f["REFERENCIA AMPLIADA"],
-            "Cargo": f["IMPORTE"],
-            "UUID": f["UUID FOLIO FISCAL"],
+            "Banco": p["BANCO"],
+            "No. Movimiento": str(rng.randint(200000, 990000)),
+            "Fecha": str(p["FECHA PAGO"])[:10],
+            "Concepto": str(p["PROVEEDORES"])[:28],
+            "Referencia": str(rng.randint(100000, 999999)),
+            "Referencia Ampliada": f"PAGO FACTURA {folio}" if folio else "TRANSFERENCIA SPEI",
+            "Cargo": -round(float(p["TOTAL PAGO"]), 2),
         })
 
-    # Un pago registrado en SAP que NO aparece en el banco
     if len(filas) > 4:
-        filas.pop(rng.randrange(len(filas)))
+        filas.pop(rng.randrange(len(filas)))          # pago SAP sin reflejo en banco
+        j = rng.randrange(len(filas))                  # un cargo con diferencia de centavos
+        filas[j]["Cargo"] = round(filas[j]["Cargo"] + rng.choice([-1, 1]) * rng.uniform(0.5, 8.0), 2)
 
-    # Comisiones bancarias sin factura (cargos sin CFDI)
     for concepto, monto in [("COMISION MEMBRESIA", -348.00),
                             ("COMISION TRANSFERENCIA SPEI", -87.00),
                             ("IVA COMISIONES", -69.60)]:
         filas.append({
             "Banco": rng.choice(["Bancomer", "Banorte"]),
             "No. Movimiento": str(rng.randint(200000, 990000)),
-            "Fecha Operación": "2025-05-30",
-            "Concepto": concepto,
-            "Referencia Ampliada": concepto,
-            "Cargo": monto,
-            "UUID": "",
+            "Fecha": "2025-05-30", "Concepto": concepto, "Referencia": "",
+            "Referencia Ampliada": concepto, "Cargo": monto,
         })
     return pd.DataFrame(filas)
 
 
-def cruzar_banco(estado: pd.DataFrame, papel: pd.DataFrame) -> dict:
-    """Cruce automático banco ↔ SAP ↔ CFDI (la columna CRUZE/DIF del papel
-    real, que hoy se hace a mano)."""
-    pagados = papel[papel["IMPORTE"].notna()].set_index("UUID FOLIO FISCAL")
-    uuids_banco = set(estado["UUID"][estado["UUID"].astype(str).str.len() > 10])
+def cruzar_banco(estado: pd.DataFrame, papel: pd.DataFrame,
+                 tolerancia_dif: float = 10.0) -> dict:
+    """Motor real de cruce banco ↔ SAP ↔ CFDI.
+
+    Por cada cargo bancario intenta, en orden:
+      1) folio de factura contenido en el texto de referencia,
+      2) importe exacto (±$0.01) contra el total del pago SAP,
+      3) importe cercano (± tolerancia) → se marca como diferencia.
+    Los pagos SAP no cruzados quedan como "sin reflejo en banco"."""
+    pagos = agrupar_pagos_sap(papel)
+    usados = set()
+
+    # Índices auxiliares
+    por_importe: dict = {}
+    folio_idx: dict = {}
+    for i, p in pagos.iterrows():
+        por_importe.setdefault(round(float(p["TOTAL PAGO"]), 2), []).append(i)
+        for folio in p["FOLIOS"]:
+            if len(folio) >= 4:
+                folio_idx.setdefault(folio, i)
+
+    def _match_folio(ref_texto):
+        tokens = set(re.findall(r"[A-Z0-9]{4,}", ref_texto))
+        for t in list(tokens):
+            tokens.update(re.findall(r"\d{4,}", t))  # números dentro de tokens
+        for t in tokens:
+            for clave in (t, t.lstrip("0")):
+                i = folio_idx.get(clave)
+                if i is not None and i not in usados:
+                    return i, clave
+        # Folio embebido en un token más largo (p.ej. FE0000001594618 → 1594618)
+        for t in tokens:
+            if len(t) < 6:
+                continue
+            for folio, i in folio_idx.items():
+                if i not in usados and len(folio) >= 5 and folio in t:
+                    return i, folio
+        return None, None
 
     filas = []
     for _, mov in estado.iterrows():
-        uuid = str(mov["UUID"])
-        if len(uuid) > 10 and uuid in pagados.index:
-            p = pagados.loc[uuid]
-            dif = round(abs(float(mov["Cargo"])) - float(p["TOTAL PAGO"]), 2)
-            filas.append({
-                "Banco": mov["Banco"], "Fecha": mov["Fecha Operación"],
-                "Concepto": mov["Concepto"], "Cargo": mov["Cargo"],
-                "# Pago SAP": p["NÚMERO DE PAGO SISTEMA"],
-                "Póliza": p["NÚMERO PÓLIZA SISTEMA"],
-                "Proveedor": p["NOMBRE"],
-                "CRUZE": abs(mov["Cargo"]),
-                "DIF": dif,
+        cargo = float(mov["Cargo"])
+        if cargo >= 0:
+            continue  # abonos: fuera del cruce de egresos
+        monto = round(abs(cargo), 2)
+        ref_texto = f"{mov['Referencia Ampliada']} {mov['Referencia']} {mov['Concepto']}".upper()
+
+        idx, folio, metodo = None, None, ""
+        i_folio, folio_hit = _match_folio(ref_texto)
+        if i_folio is not None:
+            idx, folio, metodo = i_folio, folio_hit, f"Folio {folio_hit} en referencia"
+        else:
+            candidatos = [i for i in por_importe.get(monto, []) if i not in usados]
+            if candidatos:
+                idx, metodo = candidatos[0], "Importe exacto"
+            else:
+                cercanos = [
+                    (abs(round(float(pagos.at[i, "TOTAL PAGO"]), 2) - monto), i)
+                    for i in pagos.index if i not in usados
+                    and abs(round(float(pagos.at[i, "TOTAL PAGO"]), 2) - monto) <= tolerancia_dif
+                ]
+                if cercanos:
+                    idx, metodo = min(cercanos)[1], "Importe aproximado"
+
+        base = {
+            "Banco": mov["Banco"], "Fecha": mov["Fecha"],
+            "Concepto": mov["Concepto"],
+            "Referencia": str(mov["Referencia Ampliada"])[:40],
+            "Cargo": cargo,
+        }
+        if idx is not None:
+            usados.add(idx)
+            p = pagos.loc[idx]
+            dif = round(monto - round(float(p["TOTAL PAGO"]), 2), 2)
+            base.update({
+                "# Pago SAP": str(p["NÚMERO DE PAGO SISTEMA"]),
+                "Pólizas": p["PÓLIZAS"], "Proveedor(es)": p["PROVEEDORES"],
+                "Facturas": int(p["N_FACTURAS"]),
+                "Método de cruce": metodo,
+                "CRUZE": monto, "DIF": dif,
                 "Estatus": "✅ Cruzado" if abs(dif) < 0.01 else "⚠️ Diferencia",
             })
         else:
-            filas.append({
-                "Banco": mov["Banco"], "Fecha": mov["Fecha Operación"],
-                "Concepto": mov["Concepto"], "Cargo": mov["Cargo"],
-                "# Pago SAP": "", "Póliza": "", "Proveedor": "",
+            base.update({
+                "# Pago SAP": "", "Pólizas": "", "Proveedor(es)": "",
+                "Facturas": None, "Método de cruce": "—",
                 "CRUZE": None, "DIF": None,
                 "Estatus": "❌ Cargo sin CFDI",
             })
+        filas.append(base)
 
-    # Pagos de SAP que no aparecen en el banco
-    sin_banco = pagados[~pagados.index.isin(uuids_banco)].reset_index()
-    for _, p in sin_banco.iterrows():
+    for i, p in pagos.iterrows():
+        if i in usados:
+            continue
         filas.append({
-            "Banco": p["BANCO"], "Fecha": p["FECHA DE PAGO SISTEMA"],
-            "Concepto": p["CONCEPTO"], "Cargo": None,
-            "# Pago SAP": p["NÚMERO DE PAGO SISTEMA"],
-            "Póliza": p["NÚMERO PÓLIZA SISTEMA"],
-            "Proveedor": p["NOMBRE"],
+            "Banco": p["BANCO"], "Fecha": str(p["FECHA PAGO"])[:10],
+            "Concepto": p["PROVEEDORES"], "Referencia": "",
+            "Cargo": None, "# Pago SAP": str(p["NÚMERO DE PAGO SISTEMA"]),
+            "Pólizas": p["PÓLIZAS"], "Proveedor(es)": p["PROVEEDORES"],
+            "Facturas": int(p["N_FACTURAS"]), "Método de cruce": "—",
             "CRUZE": None, "DIF": None,
             "Estatus": "🔎 Pago SAP sin reflejo en banco",
         })
@@ -1200,12 +1346,29 @@ with tab4:
     if st.session_state.resultado is None:
         st.warning("Primero ejecuta la conciliación SAT vs SAP en la pestaña **2. Conciliación Inteligente**.", icon="⚠️")
     else:
-        if st.button("🏦 Cargar Estados de Cuenta y Cruzar (simulado)", type="primary", width="stretch"):
-            with st.spinner("Leyendo estados de cuenta... Cruzando movimientos contra SAP y CFDIs..."):
-                time.sleep(2.0)
-                estado = generar_estado_cuenta_mock(st.session_state.resultado["papel"])
-                st.session_state.banco = cruzar_banco(estado, st.session_state.resultado["papel"])
-            st.toast("Cruce bancario completado", icon="🏦")
+        col_up, col_sim = st.columns(2, gap="large")
+        with col_up:
+            edo_archivo = st.file_uploader(
+                "Sube un estado de cuenta real (Excel/CSV, formato tipo BBVA)",
+                type=["csv", "xlsx", "xls", "xlsb"],
+                key="upload_banco",
+            )
+            if edo_archivo is not None and st.button("🔀 Cruzar estado de cuenta", type="primary", width="stretch"):
+                try:
+                    with st.spinner("Leyendo movimientos... Cruzando por folio e importe..."):
+                        estado = leer_estado_cuenta(edo_archivo)
+                        st.session_state.banco = cruzar_banco(estado, st.session_state.resultado["papel"])
+                    st.toast(f"{len(estado)} movimientos cruzados", icon="🏦")
+                except Exception as e:
+                    st.error(f"No pude interpretar el estado de cuenta ({e}).")
+        with col_sim:
+            st.caption("¿Sin estado de cuenta a la mano? Genera uno simulado a partir de los pagos de SAP.")
+            if st.button("🏦 Simular Estados de Cuenta y Cruzar", width="stretch"):
+                with st.spinner("Leyendo estados de cuenta... Cruzando movimientos contra SAP y CFDIs..."):
+                    time.sleep(2.0)
+                    estado = generar_estado_cuenta_mock(st.session_state.resultado["papel"])
+                    st.session_state.banco = cruzar_banco(estado, st.session_state.resultado["papel"])
+                st.toast("Cruce bancario completado", icon="🏦")
 
         b = st.session_state.get("banco")
         if b is not None:
